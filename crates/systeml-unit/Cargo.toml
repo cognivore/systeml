@@ -1,0 +1,28 @@
+[package]
+name = "systeml-unit"
+description = "Parser and typed AST for systemd unit files."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror   = { workspace = true }
+tracing     = { workspace = true }
+indexmap    = { workspace = true }
+bitflags    = { workspace = true }
+regex       = { workspace = true }
+time        = { workspace = true }
+walkdir     = { workspace = true }
+dirs        = { workspace = true }
+once_cell   = { workspace = true }
+serde       = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde", "indexmap/serde", "time/serde", "bitflags/serde"]
+
+[lints]
+workspace = true
