@@ -1,0 +1,37 @@
+[package]
+name = "systeml-runtime"
+description = "Process supervisor and timer/path/socket activation for SystemL."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+systeml-unit = { workspace = true }
+systeml-deps = { workspace = true }
+tokio        = { workspace = true }
+tokio-util   = { workspace = true }
+futures      = { workspace = true }
+async-trait  = { workspace = true }
+anyhow       = { workspace = true }
+thiserror    = { workspace = true }
+tracing      = { workspace = true }
+indexmap     = { workspace = true }
+nix          = { workspace = true, features = ["net"] }
+libc         = { workspace = true }
+once_cell    = { workspace = true }
+time         = { workspace = true }
+regex        = { workspace = true }
+dirs         = { workspace = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+kqueue = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true, features = ["full", "test-util"] }
+
+[lints]
+workspace = true
