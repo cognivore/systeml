@@ -1,0 +1,31 @@
+[package]
+name = "systeml-bus"
+description = "org.freedesktop.systemd1 D-Bus surface for SystemL via zbus."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+systeml-unit    = { workspace = true }
+systeml-deps    = { workspace = true }
+systeml-runtime = { workspace = true }
+zbus            = { workspace = true, features = ["p2p"] }
+zvariant        = { workspace = true }
+tokio           = { workspace = true }
+futures         = { workspace = true }
+async-trait     = { workspace = true }
+anyhow          = { workspace = true }
+thiserror       = { workspace = true }
+tracing         = { workspace = true }
+indexmap        = { workspace = true }
+once_cell       = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio    = { workspace = true }
+
+[lints]
+workspace = true
