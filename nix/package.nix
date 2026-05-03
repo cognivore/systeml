@@ -2,8 +2,6 @@
   lib,
   rustPlatform,
   pkg-config,
-  stdenv,
-  darwin ? null,
 }:
 
 # Builds both `systeml` (daemon) and `systemlctl` (CLI) from the workspace.
@@ -43,15 +41,10 @@ rustPlatform.buildRustPackage rec {
 
   nativeBuildInputs = [ pkg-config ];
 
-  # macOS frameworks needed by zbus / kqueue / process supervision.
-  buildInputs = lib.optionals stdenv.hostPlatform.isDarwin (
-    lib.optionals (darwin != null) [
-      darwin.apple_sdk.frameworks.CoreFoundation
-      darwin.apple_sdk.frameworks.CoreServices
-      darwin.apple_sdk.frameworks.Security
-      darwin.apple_sdk.frameworks.SystemConfiguration
-    ]
-  );
+  # On nixpkgs unstable post-2025-01, the legacy `darwin.apple_sdk.frameworks.*`
+  # namespace was retired; the system SDK frameworks (CoreFoundation,
+  # CoreServices, Security, SystemConfiguration) come in transparently
+  # via stdenv-darwin. No explicit buildInputs needed.
 
   # Both binaries are built from the workspace; -p selects them explicitly so
   # we do not pull in dev/test-only artifacts.
