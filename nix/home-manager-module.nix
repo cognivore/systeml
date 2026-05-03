@@ -31,18 +31,36 @@ let
   plistPath = "${config.home.homeDirectory}/Library/LaunchAgents/${plistLabel}.plist";
   logDir = "${config.home.homeDirectory}/Library/Logs";
 
-  # Render the LaunchAgent plist for the systeml daemon itself. The
-  # /bin/wait4path trick (cribbed from home-manager/modules/launchd/default.nix)
-  # makes launchd wait for /nix/store to be mounted before starting the
-  # daemon at boot — otherwise the binary path is unreachable on the very
-  # first launch after a fresh boot.
+  # Stable on-disk path for the systeml binary itself. The activation
+  # script copies (not symlinks) ${cfg.package}/bin/systeml here every
+  # switch.
+  #
+  # Why bother: macOS TCC keys grants by binary path + content. If the
+  # plist points directly at /nix/store/<hash>/bin/systeml, every nix
+  # update of systeml rotates <hash> and macOS treats the daemon as a
+  # brand-new binary that's never been granted Full Disk Access /
+  # Accessibility / etc. — re-prompting (or silently denying for
+  # launchd-spawned processes that get no UI prompt). With a stable
+  # location under ~/.local/state, the user grants TCC once and the
+  # grant survives systeml upgrades.
+  stableSystemlBin = "${config.home.homeDirectory}/.local/state/systeml/bin/systeml";
+  stableSystemlDir = "${config.home.homeDirectory}/.local/state/systeml/bin";
+
+  # Render the LaunchAgent plist for the systeml daemon itself.
+  #
+  # ProgramArguments[0] is the stable binary path, *not* /bin/sh wrapping
+  # wait4path. We don't need wait4path because our binary lives under
+  # the user's home, which is mounted by the time any LaunchAgent runs
+  # at login. Side benefit: macOS Login Items / Background Items shows
+  # the agent as "systeml" rather than "sh".
   daemonPlist = pkgs.writeText "${plistLabel}.plist" (
     lib.generators.toPlist { escape = true; } {
       Label = plistLabel;
       ProgramArguments = [
-        "/bin/sh"
-        "-c"
-        "/bin/wait4path /nix/store && exec ${cfg.package}/bin/systeml --foreground --log-level ${cfg.logLevel}"
+        stableSystemlBin
+        "--foreground"
+        "--log-level"
+        cfg.logLevel
       ];
       KeepAlive = true;
       RunAtLoad = true;
@@ -147,6 +165,17 @@ in
         if [[ ! -d "$XDG_RUNTIME_DIR" ]]; then
           run mkdir -p "$XDG_RUNTIME_DIR"
           run chmod 0700 "$XDG_RUNTIME_DIR"
+        fi
+
+        # 1a. Ensure the stable-systeml-binary directory exists, and
+        #     refresh the on-disk copy of the systeml binary if it has
+        #     drifted from the nix-store source. install -Dm755 -T does
+        #     an atomic copy. Skipping when content matches keeps mtime
+        #     stable, which some macOS TCC heuristics care about.
+        run mkdir -p ${lib.escapeShellArg stableSystemlDir}
+        if ! cmp -s ${cfg.package}/bin/systeml ${lib.escapeShellArg stableSystemlBin}; then
+          verboseEcho "Refreshing stable systeml binary at ${stableSystemlBin}"
+          run install -Dm755 -T ${cfg.package}/bin/systeml ${lib.escapeShellArg stableSystemlBin}
         fi
 
         # 2. Ensure ~/Library/Logs and ~/Library/LaunchAgents exist.
