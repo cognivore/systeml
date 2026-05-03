@@ -213,16 +213,108 @@ pub fn open_stream_stdio(stream: &StandardStream, unit_name: &str, which: &str) 
             Ok(Stdio::from(f))
         }
         StandardStream::Journal(_) | StandardStream::LinuxOnly(_) => {
-            let dir = journal_dir().ok_or_else(|| anyhow!("no $XDG_STATE_HOME for journal"))?;
-            std::fs::create_dir_all(&dir)
-                .with_context(|| format!("create journal dir {dir:?}"))?;
-            let path = dir.join(format!("{unit_name}.{which}.log"));
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .with_context(|| format!("open {path:?}"))?;
-            Ok(Stdio::from(f))
+            // Used to be: open the journal file and hand its fd to the
+            // child as raw stdio. Switched to a pipe so we can stamp
+            // each line with the wall-clock at write-time —
+            // journalctl(1) reads the timestamp prefix and renders it.
+            //
+            // The actual file open + write happens in
+            // `setup_journal_loggers`, which the supervisor calls
+            // immediately after `child.spawn()`. Without that follow-up
+            // the pipe will fill and the child will block on stdout
+            // writes — so any spawn site that uses a Journal-target
+            // stream MUST call setup_journal_loggers.
+            //
+            // `unit_name` and `which` are not used here any more, but
+            // we keep them in the signature for symmetry with the
+            // other arms (and because we have nowhere else to surface
+            // a "this stream wants timestamping" hint to the caller).
+            let _ = unit_name;
+            let _ = which;
+            Ok(Stdio::piped())
+        }
+    }
+}
+
+/// Per-stream timestamp + journal write-back. Reads `reader` line-by-line,
+/// prepends an RFC3339 wall-clock timestamp, appends to the unit's
+/// journal-fallback file. Spawned per (unit, stream) by the supervisor
+/// when the unit has `StandardOutput=journal` / `StandardError=journal`.
+fn spawn_logger_task<R>(reader: R, path: PathBuf, unit_name: String, which: &'static str)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+{
+    use time::format_description::well_known::Rfc3339;
+    use time::OffsetDateTime;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    tokio::spawn(async move {
+        if let Some(parent) = path.parent() {
+            let _ = tokio::fs::create_dir_all(parent).await;
+        }
+        let file = match tokio::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .await
+        {
+            Ok(f) => f,
+            Err(e) => {
+                warn!(
+                    error = %e, path = ?path, unit = %unit_name, which = %which,
+                    "journal logger: open failed"
+                );
+                return;
+            }
+        };
+        let mut writer = tokio::io::BufWriter::new(file);
+        let mut lines = BufReader::new(reader).lines();
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    let ts = OffsetDateTime::now_utc()
+                        .format(&Rfc3339)
+                        .unwrap_or_else(|_| String::from("?"));
+                    let entry = format!("{ts} {line}\n");
+                    if writer.write_all(entry.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    let _ = writer.flush().await;
+                }
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+/// Wire up timestamping logger tasks for any stream the unit configured
+/// as `Journal=` (or a Linux-only equivalent we treat as journal). Call
+/// **immediately after** `Child::spawn()` — the child will block on
+/// stdout/stderr writes until we drain the pipe.
+pub fn setup_journal_loggers(
+    child: &mut tokio::process::Child,
+    svc: &ServiceUnit,
+    unit_name: &str,
+) {
+    if matches!(
+        svc.standard_output,
+        StandardStream::Journal(_) | StandardStream::LinuxOnly(_)
+    ) {
+        if let Some(stdout) = child.stdout.take() {
+            if let Some(p) = fallback_journal_path(unit_name, "out") {
+                spawn_logger_task(stdout, p, unit_name.to_owned(), "out");
+            }
+        }
+    }
+    if matches!(
+        svc.standard_error,
+        StandardStream::Journal(_) | StandardStream::LinuxOnly(_)
+    ) {
+        if let Some(stderr) = child.stderr.take() {
+            if let Some(p) = fallback_journal_path(unit_name, "err") {
+                spawn_logger_task(stderr, p, unit_name.to_owned(), "err");
+            }
         }
     }
 }

@@ -12,7 +12,7 @@
 
 #![allow(unsafe_code)]
 
-use crate::exec::{build_command, resolve_environment};
+use crate::exec::{build_command, resolve_environment, setup_journal_loggers};
 use crate::service::notify::{bind_socket, NotifyMessage};
 use crate::service::pid_file::read_with_retry;
 use crate::state::ActiveState;
@@ -194,9 +194,10 @@ impl ServiceRunner {
         env: &BTreeMap<String, String>,
     ) -> Result<StartOutcome> {
         let mut command = build_command(&self.unit.to_string(), cmd, &self.svc, env, &[])?;
-        let child = command
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawn {}", cmd.program))?;
+        setup_journal_loggers(&mut child, &self.svc, &self.unit.to_string());
         if let Some(pid) = child.id() {
             *self.main_pid.lock().await = Some(pid as i32);
         }
@@ -251,6 +252,7 @@ impl ServiceRunner {
         let mut child = command
             .spawn()
             .with_context(|| format!("spawn {}", cmd.program))?;
+        setup_journal_loggers(&mut child, &self.svc, &self.unit.to_string());
         // Wait for original to exit.
         let _ = child.wait().await;
         // Then read PIDFile (with retry).
@@ -291,9 +293,10 @@ impl ServiceRunner {
         sock: tokio::net::UnixDatagram,
     ) -> Result<StartOutcome> {
         let mut command = build_command(&self.unit.to_string(), cmd, &self.svc, env, extra_env)?;
-        let child = command
+        let mut child = command
             .spawn()
             .with_context(|| format!("spawn {}", cmd.program))?;
+        setup_journal_loggers(&mut child, &self.svc, &self.unit.to_string());
         if let Some(pid) = child.id() {
             *self.main_pid.lock().await = Some(pid as i32);
         }
@@ -363,6 +366,7 @@ impl ServiceRunner {
         let mut child = command
             .spawn()
             .with_context(|| format!("spawn {}", cmd.program))?;
+        setup_journal_loggers(&mut child, &self.svc, &self.unit.to_string());
         let timeout = self
             .svc
             .timeout_start_sec
