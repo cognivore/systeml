@@ -46,13 +46,15 @@ rustPlatform.buildRustPackage rec {
   # CoreServices, Security, SystemConfiguration) come in transparently
   # via stdenv-darwin. No explicit buildInputs needed.
 
-  # Both binaries are built from the workspace; -p selects them explicitly so
-  # we do not pull in dev/test-only artifacts.
+  # Three binaries are built from the workspace; -p selects them explicitly
+  # so we do not pull in dev/test-only artifacts.
   cargoBuildFlags = [
     "-p"
     "systeml"
     "-p"
     "systemlctl"
+    "-p"
+    "systeml-journal"
   ];
 
   # Keep tests opt-in via `nix flake check` rather than slowing every package

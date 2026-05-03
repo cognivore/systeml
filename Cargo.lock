@@ -1227,6 +1227,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "systeml-journal"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "serde",
+ "serde_json",
+ "systeml-unit",
+]
+
+[[package]]
 name = "systeml-runtime"
 version = "0.1.0"
 dependencies = [

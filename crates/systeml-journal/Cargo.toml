@@ -1,0 +1,21 @@
+[package]
+name        = "systeml-journal"
+version     = { workspace = true }
+edition     = { workspace = true }
+authors     = { workspace = true }
+license     = { workspace = true }
+description = "journalctl-compatible reader for systeml's per-unit log fallback files."
+
+[[bin]]
+name = "journalctl"
+path = "src/main.rs"
+
+[dependencies]
+anyhow      = { workspace = true }
+clap        = { workspace = true }
+serde       = { workspace = true }
+serde_json  = { workspace = true }
+systeml-unit = { workspace = true }
+
+[lints]
+workspace = true
