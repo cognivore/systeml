@@ -42,6 +42,7 @@ pkgs.writeShellApplication {
     NEW_UNITS=""
     # Timeout is accepted for CLI compatibility but currently unused; the
     # daemon's own job timeout governs start completion.
+    # shellcheck disable=SC2034
     TIMEOUT_MS=0
 
     log()  { if [[ $VERBOSE -eq 1 ]]; then printf '[sd-switch] %s\n' "$*" >&2; fi; }
