@@ -106,6 +106,22 @@ in
       '';
     };
 
+    systemctlAlias = mkOption {
+      type = types.bool;
+      default = false;
+      description = ''
+        Install a `systemctl` symlink alongside `systemlctl` (and a
+        matching `journalctl` is already provided by the systeml package).
+
+        macOS has no native `systemctl`, so the name is free. Enable
+        this if you want shell scripts and muscle memory that type
+        `systemctl --user start foo` to work without aliasing. The
+        actual binary is the same as `systemlctl`; clap reads
+        `argv[0]` only for the program-name in help text — all
+        subcommands behave identically either way.
+      '';
+    };
+
     logLevel = mkOption {
       type = types.str;
       default = "info";
@@ -127,7 +143,17 @@ in
   # untouched — that is the contract the README promises.
   config = mkIf (isDarwin && cfg.enable) {
     # The daemon itself, plus the CLI, on the user's PATH.
-    home.packages = [ cfg.package ];
+    home.packages =
+      [ cfg.package ]
+      # Optional `systemctl` symlink. Lives in its own tiny derivation
+      # so it can be added/removed independently of cfg.package without
+      # forcing a rebuild of the systeml binaries themselves.
+      ++ lib.optional cfg.systemctlAlias (
+        pkgs.runCommand "systemctl-alias-for-systemlctl" { } ''
+          mkdir -p $out/bin
+          ln -s ${cfg.package}/bin/systemlctl $out/bin/systemctl
+        ''
+      );
 
     # Force-enable upstream's systemd.user knob. By default it is gated on
     # `pkgs.stdenv.isLinux`, which means every option underneath it would
