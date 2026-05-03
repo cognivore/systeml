@@ -16,6 +16,7 @@ clap        = { workspace = true }
 serde       = { workspace = true }
 serde_json  = { workspace = true }
 systeml-unit = { workspace = true }
+time        = { workspace = true }
 
 [lints]
 workspace = true

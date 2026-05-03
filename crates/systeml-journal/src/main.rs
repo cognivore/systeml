@@ -10,9 +10,14 @@
 //!   $XDG_STATE_HOME/systeml/journal/<unit>.err.log
 //! ```
 //!
-//! and are plain stdio captures — no per-message timestamps, no
-//! structured fields. So this `journalctl` only implements the parts of
-//! the upstream CLI that make sense for plain-text logs:
+//! Each line written by the runtime is prefixed with an RFC3339 wall-
+//! clock timestamp captured at line-flush time (see
+//! `systeml_runtime::exec::setup_journal_loggers`). We parse the prefix
+//! here and render it. Lines from older runs that lack the prefix are
+//! tolerated — they show up untimestamped.
+//!
+//! This `journalctl` only implements the parts of the upstream CLI that
+//! make sense for plain-text logs:
 //!
 //! - `-u UNIT` / `--unit UNIT` (repeatable) — show one or more units
 //! - `-f` / `--follow` — tail
@@ -37,6 +42,8 @@ use std::time::Duration;
 use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use serde::Serialize;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -59,8 +66,9 @@ struct Cli {
     #[arg(short = 'n', long = "lines", value_name = "N")]
     lines: Option<usize>,
 
-    /// Output format: `short` (default plain text), `cat` (no prefix),
-    /// or `json` (one JSON object per line).
+    /// Output format: `short` (default — locale-ish "MMM DD HH:MM:SS"),
+    /// `short-iso` (full RFC3339 timestamp), `cat` (just the message —
+    /// no prefix, no timestamp), or `json` (one JSON object per line).
     #[arg(short = 'o', long = "output", default_value = "short")]
     output: String,
 
@@ -139,27 +147,32 @@ fn run(cli: Cli) -> Result<ExitCode> {
 }
 
 // ---------------------------------------------------------------------
-// Output format
+// Output format + line parsing
 // ---------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
 enum Format {
-    /// `<unit>[<stream>]: <line>`
+    /// `MMM DD HH:MM:SS unit[stream]: line` — short systemd-style.
     Short,
-    /// `<line>` only — no decoration.
+    /// `<rfc3339> unit[stream]: line` — full ISO timestamp.
+    ShortIso,
+    /// `<line>` only — no decoration, no timestamp.
     Cat,
-    /// One JSON object per line: `{"unit":..,"stream":..,"line":..}`.
+    /// One JSON object per line:
+    /// `{"ts":"...","unit":..,"stream":..,"line":..}`.
+    /// `ts` is null for lines without a parseable timestamp prefix.
     Json,
 }
 
 fn parse_format(s: &str) -> Result<Format> {
     Ok(match s {
         "short" | "" => Format::Short,
+        "short-iso" => Format::ShortIso,
         "cat" => Format::Cat,
         "json" => Format::Json,
         other => {
             return Err(anyhow!(
-                "unknown --output format {other:?} (try short, cat, json)"
+                "unknown --output format {other:?} (try short, short-iso, cat, json)"
             ))
         }
     })
@@ -167,17 +180,82 @@ fn parse_format(s: &str) -> Result<Format> {
 
 #[derive(Serialize)]
 struct JsonRecord<'a> {
+    ts: Option<&'a str>,
     unit: &'a str,
     stream: &'a str,
     line: &'a str,
 }
 
-fn emit(unit: &str, stream: &str, line: &str, fmt: Format) {
+/// Split `<RFC3339-timestamp> <message>` into (Some(ts), msg). If the
+/// prefix isn't a parseable RFC3339 timestamp, returns (None, full
+/// line). Lines from runs predating the timestamping logger fall into
+/// the second case naturally — they just show up untimestamped.
+fn split_timestamp(line: &str) -> (Option<&str>, &str) {
+    let Some((head, rest)) = line.split_once(' ') else {
+        return (None, line);
+    };
+    if OffsetDateTime::parse(head, &Rfc3339).is_ok() {
+        (Some(head), rest)
+    } else {
+        (None, line)
+    }
+}
+
+/// Render an RFC3339 string into `MMM DD HH:MM:SS` like upstream
+/// journalctl's "short" format. Falls back to the raw RFC3339 if
+/// parsing fails (which it shouldn't, since `split_timestamp` already
+/// validated it).
+fn short_ts(rfc: &str) -> String {
+    match OffsetDateTime::parse(rfc, &Rfc3339) {
+        Ok(t) => format!(
+            "{} {:02} {:02}:{:02}:{:02}",
+            month_abbrev(t.month() as u8),
+            t.day(),
+            t.hour(),
+            t.minute(),
+            t.second()
+        ),
+        Err(_) => rfc.to_owned(),
+    }
+}
+
+fn month_abbrev(m: u8) -> &'static str {
+    match m {
+        1 => "Jan",
+        2 => "Feb",
+        3 => "Mar",
+        4 => "Apr",
+        5 => "May",
+        6 => "Jun",
+        7 => "Jul",
+        8 => "Aug",
+        9 => "Sep",
+        10 => "Oct",
+        11 => "Nov",
+        12 => "Dec",
+        _ => "???",
+    }
+}
+
+fn emit(unit: &str, stream: &str, raw: &str, fmt: Format) {
+    let (ts, msg) = split_timestamp(raw);
     match fmt {
-        Format::Short => println!("{unit}[{stream}]: {line}"),
-        Format::Cat => println!("{line}"),
+        Format::Short => match ts {
+            Some(rfc) => println!("{} {unit}[{stream}]: {msg}", short_ts(rfc)),
+            None => println!("{unit}[{stream}]: {msg}"),
+        },
+        Format::ShortIso => match ts {
+            Some(rfc) => println!("{rfc} {unit}[{stream}]: {msg}"),
+            None => println!("{unit}[{stream}]: {msg}"),
+        },
+        Format::Cat => println!("{msg}"),
         Format::Json => {
-            let rec = JsonRecord { unit, stream, line };
+            let rec = JsonRecord {
+                ts,
+                unit,
+                stream,
+                line: msg,
+            };
             // serde_json::to_string never fails for these primitive types.
             println!("{}", serde_json::to_string(&rec).unwrap());
         }
