@@ -198,10 +198,18 @@ in
         #     drifted from the nix-store source. install -Dm755 -T does
         #     an atomic copy. Skipping when content matches keeps mtime
         #     stable, which some macOS TCC heuristics care about.
+        #
+        #     If we *did* copy, also `launchctl kickstart -k` so the
+        #     running daemon picks up the new image — launchd holds the
+        #     old binary's text mapping until the process exits, so a
+        #     plain file-replacement doesn't take effect by itself.
         run mkdir -p ${lib.escapeShellArg stableSystemlDir}
         if ! cmp -s ${cfg.package}/bin/systeml ${lib.escapeShellArg stableSystemlBin}; then
           verboseEcho "Refreshing stable systeml binary at ${stableSystemlBin}"
           run install -Dm755 -T ${cfg.package}/bin/systeml ${lib.escapeShellArg stableSystemlBin}
+          systemlBinChanged=1
+        else
+          systemlBinChanged=0
         fi
 
         # 2. Ensure ~/Library/Logs and ~/Library/LaunchAgents exist.
@@ -238,6 +246,14 @@ in
           /bin/launchctl print "$domain/$agentName" >/dev/null 2>&1 \
             || /bin/launchctl bootstrap "$domain" "$dstPlist" >/dev/null 2>&1 \
             || true
+
+          # If we replaced the systeml binary at the stable path but the
+          # plist itself didn't change, launchd is still running the old
+          # binary's text mapping. Kickstart -k to give it the fresh image.
+          if [[ "$systemlBinChanged" == "1" ]]; then
+            verboseEcho "kickstarting systeml agent to pick up refreshed binary"
+            /bin/launchctl kickstart -k "$domain/$agentName" >/dev/null 2>&1 || true
+          fi
         fi
 
         # 4. Wait briefly for the daemon's bus socket to appear, then run
