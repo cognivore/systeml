@@ -33,6 +33,13 @@ pkgs.writeShellApplication {
     pkgs.gnugrep
     pkgs.gnused
   ];
+  # shellcheck SC2034 is fired on TIMEOUT_MS, which we accept on the
+  # CLI for sd-switch upstream compatibility but never read — the daemon's
+  # own job timeout governs completion. shellcheck-ignore at the
+  # writeShellApplication level so it applies across both the assignment
+  # and the case-arm `--timeout) TIMEOUT_MS="$2"`.
+  excludeShellChecks = [ "SC2034" ];
+
   text = ''
     set -euo pipefail
 
@@ -40,9 +47,6 @@ pkgs.writeShellApplication {
     VERBOSE=0
     OLD_UNITS=""
     NEW_UNITS=""
-    # Timeout is accepted for CLI compatibility but currently unused; the
-    # daemon's own job timeout governs start completion.
-    # shellcheck disable=SC2034
     TIMEOUT_MS=0
 
     log()  { if [[ $VERBOSE -eq 1 ]]; then printf '[sd-switch] %s\n' "$*" >&2; fi; }
