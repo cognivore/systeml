@@ -132,7 +132,7 @@ async fn path_predicate_initial_true_when_file_present() {
 
 #[tokio::test]
 async fn timer_next_fire_minutely() {
-    use systeml_runtime::timer::schedule::next_fire;
+    use systeml_unit::schedule::next_fire;
     use systeml_unit::CalendarSpec;
     use time::macros::datetime;
 

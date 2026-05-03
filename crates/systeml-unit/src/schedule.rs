@@ -1,7 +1,7 @@
 //! Calendar next-fire computation. Walks forward minute-by-minute with a
 //! month skip-ahead optimisation.
 
-use systeml_unit::calendar::{CalendarSpec, FieldSet};
+use crate::calendar::{CalendarSpec, FieldSet};
 use time::{Date, Month, OffsetDateTime, PrimitiveDateTime, Time};
 
 /// Compute the next instant strictly after `now` (and strictly after `last`,

@@ -1,18 +1,22 @@
 //! `.timer` activation engine.
 //!
-//! [`schedule`] is a pure-function next-fire calculator. Persistent state for
-//! `Persistent=yes` lives at `$XDG_STATE_HOME/systeml/timers/<name>.timer`.
+//! Persistent state for `Persistent=yes` lives at
+//! `$XDG_STATE_HOME/systeml/timers/<name>.timer`. The pure next-fire
+//! calculator is in [`systeml_unit::schedule`] so it can be reused
+//! without pulling tokio in. The wake-up loop that actually triggers
+//! linked services lives in [`firing`].
 
-pub mod schedule;
+pub mod firing;
 
 use anyhow::{anyhow, Result};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use systeml_unit::schedule;
 use systeml_unit::timer::TimerUnit;
 use systeml_unit::UnitName;
 use time::OffsetDateTime;
 
-pub use schedule::next_fire;
+pub use systeml_unit::schedule::next_fire;
 
 /// Where we persist last-fire timestamps.
 pub fn state_file(name: &UnitName) -> Option<PathBuf> {

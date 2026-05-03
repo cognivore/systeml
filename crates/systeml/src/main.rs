@@ -55,6 +55,14 @@ async fn main() -> Result<()> {
 
     let manager = Arc::new(RwLock::new(Manager::new()));
 
+    // Spawn the timer firing engine and hand the manager its control
+    // sender so daemon-reload / timer state changes wake it up.
+    let timer_tx = systeml_runtime::timer::firing::spawn(manager.clone());
+    {
+        let mut m = manager.write().await;
+        m.attach_timer_control(timer_tx);
+    }
+
     // Load every unit from the search path.
     {
         let mut m = manager.write().await;

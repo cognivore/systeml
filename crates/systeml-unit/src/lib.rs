@@ -107,6 +107,7 @@ pub mod linux_only;
 pub mod load;
 pub mod name;
 pub mod path_unit;
+pub mod schedule;
 pub mod search;
 pub mod service;
 pub mod socket;

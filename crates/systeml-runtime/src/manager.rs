@@ -7,6 +7,7 @@
 use crate::install;
 use crate::service::ServiceRunner;
 use crate::state::{ActiveState, LoadState, UnitStatus};
+use crate::timer::firing::{TimerControl, TimerControlSender};
 use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
@@ -88,6 +89,9 @@ pub struct Manager {
     pub events: tokio::sync::broadcast::Sender<UnitEvent>,
     /// Monotonic job-id counter.
     pub next_job_id: u32,
+    /// Control sender for the timer firing engine. `None` if no
+    /// scheduler is attached (tests, headless usage).
+    pub timer_control: Option<TimerControlSender>,
 }
 
 impl Default for Manager {
@@ -107,6 +111,25 @@ impl Manager {
             services: IndexMap::new(),
             events: tx,
             next_job_id: 1,
+            timer_control: None,
+        }
+    }
+
+    /// Attach a timer-firing scheduler's control sender. The daemon
+    /// passes this in after spawning [`crate::timer::firing::spawn`].
+    /// Subsequent `daemon_reload`s and timer state changes will poke
+    /// the scheduler via this channel.
+    pub fn attach_timer_control(&mut self, tx: TimerControlSender) {
+        self.timer_control = Some(tx);
+    }
+
+    /// Best-effort: tell the timer scheduler something changed.
+    fn poke_timer_scheduler(&self) {
+        if let Some(tx) = &self.timer_control {
+            // try_send returns Err if the channel is full (drop the
+            // message — Refresh is idempotent, the next one will
+            // suffice) or closed (scheduler shut down — fine).
+            let _ = tx.try_send(TimerControl::Refresh);
         }
     }
 
@@ -218,6 +241,8 @@ impl Manager {
             let _ = self.events.send(UnitEvent::UnitNew(name));
         }
         info!("daemon-reload: {} units loaded", self.units.len());
+        // Wake the timer scheduler so it picks up new/removed timers.
+        self.poke_timer_scheduler();
         Ok(())
     }
 
@@ -539,6 +564,10 @@ impl Manager {
             st.active = ActiveState::Active;
             st.sub = "running".into();
         }
+        // A newly-active timer needs the scheduler to recompute.
+        if name.kind == UnitKind::Timer {
+            self.poke_timer_scheduler();
+        }
         Ok(JobOutcome::Done)
     }
 
@@ -561,6 +590,10 @@ impl Manager {
         if let Some(st) = self.status.get_mut(name) {
             st.active = ActiveState::Inactive;
             st.sub = "dead".into();
+        }
+        // A newly-inactive timer should drop out of the scheduler's view.
+        if name.kind == UnitKind::Timer {
+            self.poke_timer_scheduler();
         }
         Ok(JobOutcome::Done)
     }
