@@ -186,17 +186,27 @@ async fn run(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Cmd::Enable { units } => {
-            let (carries, changes) = proxy.enable_unit_files(&units).await?;
-            print_changes(&changes);
-            if !carries && !cli.quiet {
-                eprintln!("warning: none of the listed units carry [Install] info");
+            if std::env::var("SYSTEML_ALLOW_IMPERATIVE_ENABLE").as_deref() == Ok("1") {
+                let (carries, changes) = proxy.enable_unit_files(&units).await?;
+                print_changes(&changes);
+                if !carries && !cli.quiet {
+                    eprintln!("warning: none of the listed units carry [Install] info");
+                }
+                Ok(ExitCode::SUCCESS)
+            } else {
+                refuse_imperative("enable", &units);
+                Ok(ExitCode::from(2))
             }
-            Ok(ExitCode::SUCCESS)
         }
         Cmd::Disable { units } => {
-            let changes = proxy.disable_unit_files(&units).await?;
-            print_changes(&changes);
-            Ok(ExitCode::SUCCESS)
+            if std::env::var("SYSTEML_ALLOW_IMPERATIVE_ENABLE").as_deref() == Ok("1") {
+                let changes = proxy.disable_unit_files(&units).await?;
+                print_changes(&changes);
+                Ok(ExitCode::SUCCESS)
+            } else {
+                refuse_imperative("disable", &units);
+                Ok(ExitCode::from(2))
+            }
         }
         Cmd::Mask { units } => {
             let changes = proxy.mask_unit_files(&units).await?;
@@ -355,6 +365,48 @@ fn print_changes(changes: &[(String, String, String)]) {
             other => println!("{other} {target} {source}"),
         }
     }
+}
+
+/// Refuse `enable` / `disable` when home-manager is the source of truth.
+///
+/// We expect units to be installed declaratively via
+/// `systemd.user.services.<name>` etc. in a home-manager config.
+/// Imperative `systemlctl enable` would create symlinks on disk that
+/// the next `home-manager switch` would either tear down or overwrite,
+/// causing confusing drift. Refuse loudly with a clear redirect; offer
+/// an env-var escape hatch for emergencies (debugging, recovery).
+fn refuse_imperative(action: &str, units: &[String]) {
+    eprintln!(
+        "systemlctl: refusing to {action} unit(s): {}",
+        units.join(", ")
+    );
+    eprintln!();
+    eprintln!(
+        "  home-manager owns enable/disable state for SystemL. To {action} a unit:"
+    );
+    eprintln!();
+    eprintln!(
+        "    1. Edit your home-manager config so the unit's [Install] section"
+    );
+    eprintln!(
+        "       is {}.",
+        if action == "enable" {
+            "reachable from a target your machine wants (e.g. WantedBy=timers.target)"
+        } else {
+            "removed (or remove the unit declaration entirely)"
+        }
+    );
+    eprintln!("    2. Run `home-manager switch`.");
+    eprintln!();
+    eprintln!(
+        "  Imperative {action} would drift from the declarative state and be"
+    );
+    eprintln!(
+        "  overwritten by the next switch. If you really need to bypass this"
+    );
+    eprintln!(
+        "  guard (e.g. for debugging), set SYSTEML_ALLOW_IMPERATIVE_ENABLE=1."
+    );
 }
 
 async fn print_status(proxy: &ManagerProxy<'_>, unit: &str) -> Result<()> {
