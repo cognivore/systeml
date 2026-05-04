@@ -395,6 +395,17 @@ impl ServiceRunner {
     }
 
     /// Run an `Exec*=` synchronously and wait for completion.
+    ///
+    /// Honors `TimeoutStartSec=`. Per `man systemd.service`:
+    ///
+    /// > Defaults to `DefaultTimeoutStartSec=` from the manager
+    /// > configuration file, except when `Type=oneshot` is used, in which
+    /// > case the timeout is disabled by default.
+    ///
+    /// So `Type=oneshot` services default to no timeout (long-running
+    /// backups, migrations, etc. are the canonical use case). Other
+    /// service types fall back to 90s, matching systemd's
+    /// `DefaultTimeoutStartSec=`.
     pub async fn run_oneshot(
         &self,
         cmd: &ExecCommand,
@@ -410,7 +421,10 @@ impl ServiceRunner {
             .svc
             .timeout_start_sec
             .map(|d| d.as_std())
-            .unwrap_or(Duration::from_secs(90));
+            .unwrap_or_else(|| match self.svc.service_type {
+                ServiceType::Oneshot => Duration::MAX,
+                _ => Duration::from_secs(90),
+            });
         match tokio::time::timeout(timeout, child.wait()).await {
             Ok(Ok(st)) => Ok(st),
             Ok(Err(e)) => Err(anyhow!("wait: {e}")),

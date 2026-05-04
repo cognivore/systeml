@@ -534,6 +534,14 @@ impl Manager {
     }
 
     /// Start a unit. Returns the queued job's id.
+    ///
+    /// For service units the actual `runner.start()` work runs in a
+    /// background task rather than inline under our caller's lock —
+    /// `Type=oneshot` services can run for hours (a daily backup is the
+    /// canonical example) and we must not pin the manager's write lock
+    /// for the duration. The bus method that called us reply-times out
+    /// otherwise, and any other timer that fires during the run gets
+    /// blocked behind the lock.
     pub async fn start_unit(&mut self, name: UnitName, mode: JobMode) -> Result<JobId> {
         let id = self.alloc_job_id();
         let _ = self.events.send(UnitEvent::JobNew {
@@ -541,6 +549,10 @@ impl Manager {
             unit: name.clone(),
             kind: JobType::Start,
         });
+        if name.kind == UnitKind::Service {
+            self.spawn_service_start(name, mode, id)?;
+            return Ok(id);
+        }
         let outcome = self.run_start(&name, mode).await?;
         let _ = self.events.send(UnitEvent::JobRemoved {
             id,
@@ -548,6 +560,54 @@ impl Manager {
             outcome,
         });
         Ok(id)
+    }
+
+    /// Hand off the service-start work to a tokio task that *does not*
+    /// hold the manager's write lock while awaiting the spawned process.
+    /// The task acquires the lock briefly twice: once at the end to
+    /// publish the final state via `mark_state`, and once to attach the
+    /// exit-detection supervisor for long-lived service types.
+    fn spawn_service_start(&self, name: UnitName, _mode: JobMode, id: JobId) -> Result<()> {
+        let runner = self
+            .services
+            .get(&name)
+            .cloned()
+            .ok_or_else(|| anyhow!("no runner for {name}"))?;
+        let weak = self
+            .self_weak
+            .clone()
+            .ok_or_else(|| anyhow!("manager self-weak not attached"))?;
+        let events = self.events.clone();
+        tokio::spawn(async move {
+            let outcome_result = runner.start().await;
+            let active = *runner.state.lock().await;
+            let sub = runner.sub.lock().await.clone();
+            if let Some(arc) = weak.upgrade() {
+                let mut mgr = arc.write().await;
+                mgr.mark_state(&name, active, &sub);
+                if active == ActiveState::Active
+                    && !matches!(
+                        runner.svc.service_type,
+                        systeml_unit::service::ServiceType::Oneshot
+                            | systeml_unit::service::ServiceType::Dbus
+                    )
+                {
+                    if let Some(weak2) = mgr.self_weak.clone() {
+                        crate::service::supervise::spawn(weak2, runner.clone(), name.clone());
+                    }
+                }
+            }
+            let outcome = match outcome_result {
+                Ok(out) if out.error.is_none() => JobOutcome::Done,
+                _ => JobOutcome::Failed,
+            };
+            let _ = events.send(UnitEvent::JobRemoved {
+                id,
+                unit: name,
+                outcome,
+            });
+        });
+        Ok(())
     }
 
     /// Stop a unit.
@@ -567,7 +627,9 @@ impl Manager {
         Ok(id)
     }
 
-    /// Restart a unit.
+    /// Restart a unit. Service-kind restarts borrow the same off-the-lock
+    /// pattern as `start_unit` so a long-running oneshot's restart
+    /// doesn't pin the manager either.
     pub async fn restart_unit(&mut self, name: UnitName, mode: JobMode) -> Result<JobId> {
         let id = self.alloc_job_id();
         let _ = self.events.send(UnitEvent::JobNew {
@@ -576,6 +638,10 @@ impl Manager {
             kind: JobType::Restart,
         });
         let _ = self.run_stop(&name).await;
+        if name.kind == UnitKind::Service {
+            self.spawn_service_start(name, mode, id)?;
+            return Ok(id);
+        }
         let outcome = self.run_start(&name, mode).await?;
         let _ = self.events.send(UnitEvent::JobRemoved {
             id,
