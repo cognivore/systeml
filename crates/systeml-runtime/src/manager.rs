@@ -567,12 +567,18 @@ impl Manager {
     /// The task acquires the lock briefly twice: once at the end to
     /// publish the final state via `mark_state`, and once to attach the
     /// exit-detection supervisor for long-lived service types.
-    fn spawn_service_start(&self, name: UnitName, _mode: JobMode, id: JobId) -> Result<()> {
+    fn spawn_service_start(&mut self, name: UnitName, _mode: JobMode, id: JobId) -> Result<()> {
         let runner = self
             .services
             .get(&name)
             .cloned()
             .ok_or_else(|| anyhow!("no runner for {name}"))?;
+        // Publish Activating up-front so callers querying `status`
+        // immediately see "the start is in flight." Without this, a
+        // 10-hour backup would read as `Inactive (dead)` until it
+        // finished, since the supervisor's `mark_state` only runs at
+        // exit time.
+        self.mark_state(&name, ActiveState::Activating, "start");
         let weak = self
             .self_weak
             .clone()
