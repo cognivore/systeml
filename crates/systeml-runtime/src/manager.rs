@@ -315,41 +315,43 @@ impl Manager {
                     description: lu.unit.description.clone(),
                     ..UnitStatus::default()
                 });
-            // Service runner: refresh on every reload so a unit-file
+            // Service runner: rebuild on every reload so a unit-file
             // change (e.g. a new ExecStart from `home-manager switch`)
-            // takes effect at the next start. Refreshing while a unit
-            // is Active would orphan the running process; in that case
-            // we keep the existing runner — its cached `ServiceUnit`
-            // describes the *currently running* invocation, which is
-            // what `stop()` needs to send signals correctly. The
-            // refreshed spec applies on the next start_unit cycle.
+            // takes effect at the next start. Real systemd's
+            // `manager_reload` (src/core/manager.c:3555) serializes
+            // runtime state, drops every Unit struct, re-parses every
+            // fragment from disk, then deserializes the runtime state
+            // back — net effect: the spec is always fresh, but PIDs
+            // and child handles survive. We approximate that here:
+            // construct a new `ServiceRunner` from the freshly-parsed
+            // `ServiceUnit`, then transfer the live PID/child handle
+            // from the old runner so `stop()` can still signal the
+            // process. The supervisor task already holds an `Arc` to
+            // the old runner via `Arc::clone`, so its in-flight
+            // `child.wait()` is unaffected by us swapping the map
+            // entry.
             //
             // Without this, `daemon-reload` re-read the unit file but
-            // any subsequent `start_unit` re-ran the *old* ExecStart
+            // `start_unit` kept re-running the *old* `ExecStart`
             // because `ServiceRunner` cached the original `svc` at
-            // construction. That bit a backup-home update where the
-            // wrapper's ExecStart pointed at a refreshed exclude file:
-            // the daemon kept invoking the old wrapper with the old
-            // exclude list and the run kept failing on TCC paths the
-            // new excludes had already covered.
-            if let Some(svc) = match &lu.unit.kind {
-                UnitTypeData::Service(s) => Some(s),
-                _ => None,
-            } {
-                let active = self
-                    .status
-                    .get(&name)
-                    .map(|s| s.active != ActiveState::Inactive)
-                    .unwrap_or(false);
-                let already_present = self.services.contains_key(&name);
-                // Refresh whenever the unit is idle, or on first sight.
-                // While the unit is Active we leave the existing runner
-                // alone so `stop()` can still kill the running process
-                // using the *original* spec.
-                if !active || !already_present {
-                    self.services
-                        .insert(name.clone(), ServiceRunner::new(name.clone(), svc.clone()));
+            // construction. That bit a backup-home update: the wrapper
+            // path changed (new exclude file inside it), but
+            // post-`daemon-reload` runs invoked the previous wrapper
+            // and kept failing on TCC paths the new excludes had
+            // already covered.
+            if let UnitTypeData::Service(svc) = &lu.unit.kind {
+                let new_runner = ServiceRunner::new(name.clone(), svc.clone());
+                if let Some(old) = self.services.get(&name) {
+                    // Transfer in-flight tracking. State/sub mirror
+                    // what the manager's status already says (we
+                    // re-publish on the next start/stop), but the PID
+                    // and child handle are load-bearing for stop().
+                    *new_runner.state.lock().await = *old.state.lock().await;
+                    *new_runner.sub.lock().await = old.sub.lock().await.clone();
+                    *new_runner.main_pid.lock().await = *old.main_pid.lock().await;
+                    *new_runner.child.lock().await = old.child.lock().await.take();
                 }
+                self.services.insert(name.clone(), new_runner);
             }
             self.units.insert(name.clone(), lu);
             self.status.insert(name.clone(), st);
