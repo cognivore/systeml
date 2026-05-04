@@ -6,5 +6,6 @@
 pub mod notify;
 pub mod pid_file;
 pub mod runner;
+pub mod supervise;
 
 pub use runner::{ServiceRunner, StartOutcome};

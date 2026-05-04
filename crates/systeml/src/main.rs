@@ -54,6 +54,13 @@ async fn main() -> Result<()> {
     info!(runtime_dir = %runtime_dir.display(), "runtime dir");
 
     let manager = Arc::new(RwLock::new(Manager::new()));
+    // Plumb the manager's self-weak handle so per-service supervisor
+    // tasks can broadcast `StateChanged` when a child exits without
+    // creating a strong-reference cycle.
+    {
+        let mut m = manager.write().await;
+        m.attach_self(&manager);
+    }
 
     // Spawn the timer firing engine and hand the manager its control
     // sender so daemon-reload / timer state changes wake it up.
@@ -78,8 +85,7 @@ async fn main() -> Result<()> {
         .clone()
         .unwrap_or_else(systeml_bus::default_socket_path);
     if let Some(dir) = socket_path.parent() {
-        std::fs::create_dir_all(dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
         // 0700 — only the owner can talk to us.
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).ok();
     }
@@ -147,8 +153,7 @@ fn ensure_runtime_dir() -> Result<PathBuf> {
     }
     let uid = nix::unistd::Uid::current().as_raw();
     let dir = std::env::temp_dir().join(format!("systeml-{uid}"));
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("create {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
         .context("set perms on runtime dir")?;
     // Persist for the bus and runtime crates.

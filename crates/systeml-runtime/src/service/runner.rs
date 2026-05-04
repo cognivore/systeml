@@ -19,17 +19,16 @@ use crate::state::ActiveState;
 use anyhow::{anyhow, Context, Result};
 use std::collections::BTreeMap;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use systeml_unit::exec::{ExecCommand, ExecFlags};
-use systeml_unit::service::{
-    KillMode, ProcessOutcome, ServiceType, ServiceUnit, StandardStream,
-};
+use systeml_unit::service::{KillMode, ProcessOutcome, ServiceType, ServiceUnit, StandardStream};
 use systeml_unit::UnitName;
 use tokio::process::Child;
 use tokio::sync::Mutex;
 use tokio::time::sleep;
-use tracing::{info, warn};
+use tracing::info;
 
 /// Outcome of one supervised `start()` cycle.
 #[derive(Debug, Clone)]
@@ -60,6 +59,11 @@ pub struct ServiceRunner {
     pub restarts: Mutex<u32>,
     /// Last process outcome (used for `Restart=` decisions).
     pub last_outcome: Mutex<Option<ProcessOutcome>>,
+    /// Set by `request_stop()` (called from `stop()`) so the supervisor
+    /// task knows not to write its own final state — `stop()` does that.
+    /// Without this flag, supervisor and stop race to set
+    /// `state`/`sub` after the child exits in response to `SIGTERM`.
+    pub stopping: AtomicBool,
 }
 
 impl ServiceRunner {
@@ -75,11 +79,31 @@ impl ServiceRunner {
             status: Mutex::new(None),
             restarts: Mutex::new(0),
             last_outcome: Mutex::new(None),
+            stopping: AtomicBool::new(false),
         })
+    }
+
+    /// Tell the supervisor task that an explicit stop is in progress.
+    /// `stop()` will set the final state itself; the supervisor must not
+    /// race with that.
+    pub fn request_stop(&self) {
+        self.stopping.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether `stop()` has signalled an explicit teardown.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping.load(Ordering::SeqCst)
+    }
+
+    /// Clear the stop signal. Called when a fresh `start()` begins so the
+    /// new lifecycle starts unflagged.
+    pub fn clear_stop(&self) {
+        self.stopping.store(false, Ordering::SeqCst);
     }
 
     /// Run the start sequence end-to-end. Sets `state` to `Active` on success.
     pub async fn start(&self) -> Result<StartOutcome> {
+        self.clear_stop();
         *self.state.lock().await = ActiveState::Activating;
         *self.sub.lock().await = "start-pre".into();
 
@@ -172,11 +196,23 @@ impl ServiceRunner {
             }
             ServiceType::Notify | ServiceType::NotifyReload => {
                 let sock = notify_sock.take().expect("notify socket built above");
-                self.start_notify(exec_start, &env, &notify_extra, sock).await
+                self.start_notify(exec_start, &env, &notify_extra, sock)
+                    .await
             }
             ServiceType::Dbus => {
-                warn!(unit = %self.unit, "Type=dbus is not supported on macOS; treating as simple");
-                self.start_simple(exec_start, &env).await
+                // Dbus activation requires a system D-Bus broker tracking
+                // BusName ownership. macOS has no system D-Bus and we don't
+                // ship a polyfill. Refuse the start outright instead of
+                // silently degrading to Type=simple — the user's intent
+                // (own this BusName before declaring readiness) is not
+                // something we can fulfil, and pretending otherwise would
+                // hide a misconfiguration.
+                *self.state.lock().await = ActiveState::Failed;
+                *self.sub.lock().await = "failed".into();
+                Err(anyhow!(
+                    "Type=dbus is not supported on macOS (no system D-Bus broker); \
+                     change the unit to Type=notify or Type=simple"
+                ))
             }
         }
         .inspect(|_| {
@@ -240,7 +276,10 @@ impl ServiceRunner {
         for c in &self.svc.exec_start_post {
             let _ = self.run_oneshot(c, env, &[]).await;
         }
-        Ok(StartOutcome { active, error: None })
+        Ok(StartOutcome {
+            active,
+            error: None,
+        })
     }
 
     async fn start_forking(
@@ -386,9 +425,12 @@ impl ServiceRunner {
     /// Stop the unit. Runs `ExecStop`, sends `KillSignal` (default `SIGTERM`),
     /// then `SIGKILL` after `TimeoutStopSec`.
     pub async fn stop(&self) -> Result<()> {
+        // Tell the supervisor we own the final state transition so it
+        // doesn't write a competing Inactive/Failed when the child exits.
+        self.request_stop();
         *self.state.lock().await = ActiveState::Deactivating;
         *self.sub.lock().await = "stop".into();
-        let env = resolve_environment(&self.svc).unwrap_or_default();
+        let env = resolve_environment(&self.svc).context("resolve EnvironmentFile= for stop")?;
 
         for cmd in self.svc.exec_stop.clone() {
             let _ = self.run_oneshot(&cmd, &env, &[]).await;
@@ -396,7 +438,12 @@ impl ServiceRunner {
 
         let pid = *self.main_pid.lock().await;
         if let Some(pid) = pid {
-            let signal = parse_signal(self.svc.kill_signal.as_deref()).unwrap_or(nix::sys::signal::Signal::SIGTERM);
+            // KillSignal is validated at parse time, so any string here is
+            // a known signal name. None means "use the systemd default."
+            let signal = match self.svc.kill_signal.as_deref() {
+                Some(name) => parse_signal_strict(name)?,
+                None => nix::sys::signal::Signal::SIGTERM,
+            };
             let kill_target = match self.svc.kill_mode {
                 KillMode::Process => Target::Pid(pid),
                 KillMode::ControlGroup | KillMode::Mixed => Target::ProcessGroup(pid),
@@ -537,9 +584,13 @@ impl Target {
     }
 }
 
-fn parse_signal(name: Option<&str>) -> Option<nix::sys::signal::Signal> {
+/// Translate a validated KillSignal string into a `nix::Signal`. The unit
+/// parser rejects unknown names, so any string reaching here was accepted
+/// — but we still error rather than fall back to SIGTERM if a logic gap
+/// lets an unknown name through.
+fn parse_signal_strict(name: &str) -> Result<nix::sys::signal::Signal> {
     use nix::sys::signal::Signal::*;
-    Some(match name? {
+    Ok(match name {
         "SIGTERM" => SIGTERM,
         "SIGKILL" => SIGKILL,
         "SIGINT" => SIGINT,
@@ -548,7 +599,7 @@ fn parse_signal(name: Option<&str>) -> Option<nix::sys::signal::Signal> {
         "SIGUSR2" => SIGUSR2,
         "SIGQUIT" => SIGQUIT,
         "SIGABRT" => SIGABRT,
-        _ => return None,
+        other => return Err(anyhow!("unknown signal name: {other}")),
     })
 }
 

@@ -221,6 +221,18 @@ fn parse_bool(s: &str) -> Option<bool> {
     })
 }
 
+/// Validate a `KillSignal=`/`RestartKillSignal=`/`FinalKillSignal=`/
+/// `WatchdogSignal=` value at parse time. Accepts only signals systeml's
+/// runtime can actually deliver. Rejecting unknown names here means the
+/// runner doesn't have to silently fall back to SIGTERM at stop time.
+fn validate_signal_name(s: &str) -> Result<String, String> {
+    match s {
+        "SIGTERM" | "SIGKILL" | "SIGINT" | "SIGHUP" | "SIGUSR1" | "SIGUSR2" | "SIGQUIT"
+        | "SIGABRT" => Ok(s.to_owned()),
+        _ => Err(format!("unknown signal name {s:?}")),
+    }
+}
+
 /// Whitespace + comma-separated list.
 fn parse_list(s: &str) -> Vec<String> {
     s.split(|c: char| c.is_whitespace() || c == ',')
@@ -331,11 +343,13 @@ fn apply_unit_section(
         "SourcePath" => unit.source_path = Some(PathBuf::from(v)),
         // Conditions / asserts.
         k if k.starts_with("Condition") => {
-            let c = Condition::parse(&k["Condition".len()..], v);
+            let c = Condition::parse(&k["Condition".len()..], v)
+                .map_err(|r| bad(path, "Unit", e, r))?;
             unit.conditions.conditions.push(c);
         }
         k if k.starts_with("Assert") => {
-            let c = Condition::parse(&k["Assert".len()..], v);
+            let c = Condition::parse(&k["Assert".len()..], v)
+                .map_err(|r| bad(path, "Unit", e, r))?;
             unit.conditions.asserts.push(c);
         }
         _ => {
@@ -538,10 +552,22 @@ fn parse_service(
             "KillMode" => {
                 svc.kill_mode = KillMode::parse(v).map_err(|r| bad(path, "Service", e, r))?;
             }
-            "KillSignal" => svc.kill_signal = Some(v.to_owned()),
-            "RestartKillSignal" => svc.restart_kill_signal = Some(v.to_owned()),
-            "FinalKillSignal" => svc.final_kill_signal = Some(v.to_owned()),
-            "WatchdogSignal" => svc.watchdog_signal = Some(v.to_owned()),
+            "KillSignal" => {
+                svc.kill_signal =
+                    Some(validate_signal_name(v).map_err(|r| bad(path, "Service", e, r))?);
+            }
+            "RestartKillSignal" => {
+                svc.restart_kill_signal =
+                    Some(validate_signal_name(v).map_err(|r| bad(path, "Service", e, r))?);
+            }
+            "FinalKillSignal" => {
+                svc.final_kill_signal =
+                    Some(validate_signal_name(v).map_err(|r| bad(path, "Service", e, r))?);
+            }
+            "WatchdogSignal" => {
+                svc.watchdog_signal =
+                    Some(validate_signal_name(v).map_err(|r| bad(path, "Service", e, r))?);
+            }
             "SendSIGKILL" => {
                 svc.send_sigkill =
                     parse_bool(v).ok_or_else(|| bad(path, "Service", e, "expected bool"))?;

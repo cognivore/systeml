@@ -91,7 +91,13 @@ impl Condition {
     ///
     /// `key` should be the directive key with the leading `Condition` or
     /// `Assert` already stripped (e.g. `PathExists`).
-    pub fn parse(key: &str, value: &str) -> Self {
+    ///
+    /// Errors on malformed boolean values (e.g.
+    /// `ConditionFirstBoot=maybe`). Unknown condition keys are *not* an
+    /// error — they round-trip as `ConditionCheck::Unknown` for forward
+    /// compatibility, matching upstream systemd's tolerance for newer
+    /// conditions on older parsers.
+    pub fn parse(key: &str, value: &str) -> Result<Self, String> {
         let mut neg = false;
         let mut trig = false;
         let mut v = value.trim();
@@ -123,10 +129,16 @@ impl Condition {
             "Architecture" => ConditionCheck::Architecture(v.into()),
             "Virtualization" => ConditionCheck::Virtualization(v.into()),
             "Environment" => ConditionCheck::Environment(v.into()),
-            "FirstBoot" => ConditionCheck::FirstBoot(parse_bool(v).unwrap_or(false)),
+            "FirstBoot" => ConditionCheck::FirstBoot(
+                parse_bool(v)
+                    .ok_or_else(|| format!("ConditionFirstBoot expects a boolean, got {v:?}"))?,
+            ),
             "KernelCommandLine" => ConditionCheck::KernelCommandLine(v.into()),
             "KernelVersion" => ConditionCheck::KernelVersion(v.into()),
-            "ACPower" => ConditionCheck::AcPower(parse_bool(v).unwrap_or(true)),
+            "ACPower" => ConditionCheck::AcPower(
+                parse_bool(v)
+                    .ok_or_else(|| format!("ConditionACPower expects a boolean, got {v:?}"))?,
+            ),
             "NeedsUpdate" => ConditionCheck::NeedsUpdate(v.into()),
             "Memory" => ConditionCheck::Memory(v.into()),
             "CPUs" => ConditionCheck::Cpus(v.into()),
@@ -138,11 +150,11 @@ impl Condition {
                 value: v.to_owned(),
             },
         };
-        Self {
+        Ok(Self {
             check,
             negate: neg,
             trigger: trig,
-        }
+        })
     }
 }
 
@@ -170,28 +182,34 @@ mod tests {
 
     #[test]
     fn parse_negate() {
-        let c = Condition::parse("PathExists", "!/etc/foo");
+        let c = Condition::parse("PathExists", "!/etc/foo").unwrap();
         assert!(c.negate);
         assert!(matches!(c.check, ConditionCheck::PathExists(p) if p.to_str() == Some("/etc/foo")));
     }
 
     #[test]
     fn parse_trigger() {
-        let c = Condition::parse("PathExists", "|/etc/foo");
+        let c = Condition::parse("PathExists", "|/etc/foo").unwrap();
         assert!(c.trigger);
         assert!(!c.negate);
     }
 
     #[test]
     fn parse_trigger_and_negate() {
-        let c = Condition::parse("PathExists", "|!/etc/foo");
+        let c = Condition::parse("PathExists", "|!/etc/foo").unwrap();
         assert!(c.trigger);
         assert!(c.negate);
     }
 
     #[test]
     fn unknown_preserved() {
-        let c = Condition::parse("FooBarBaz", "wat");
+        let c = Condition::parse("FooBarBaz", "wat").unwrap();
         assert!(matches!(c.check, ConditionCheck::Unknown { .. }));
+    }
+
+    #[test]
+    fn malformed_bool_errors() {
+        assert!(Condition::parse("FirstBoot", "maybe").is_err());
+        assert!(Condition::parse("ACPower", "kinda").is_err());
     }
 }

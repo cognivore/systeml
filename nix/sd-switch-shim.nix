@@ -67,7 +67,10 @@ pkgs.writeShellApplication {
         --timeout)    TIMEOUT_MS="$2"; shift 2 ;;
         --old-units)  OLD_UNITS="$2"; shift 2 ;;
         --new-units)  NEW_UNITS="$2"; shift 2 ;;
-        *)            warn "ignoring unknown argument: $1"; shift ;;
+        # Refuse unknown arguments outright. Silent skip would mask new
+        # home-manager flags we haven't taught this shim about — the
+        # activation might appear to succeed while doing the wrong thing.
+        *)            echo "sd-switch: unknown argument: $1" >&2; exit 2 ;;
       esac
     done
 
@@ -109,8 +112,12 @@ pkgs.writeShellApplication {
         stop-start) run systemlctl --user stop    "$name"
                     run systemlctl --user start   "$name" ;;
         keep-old)   log "keeping old: $name (X-SwitchMethod=keep-old)" ;;
-        *)          warn "unknown X-SwitchMethod '$method' for $name; falling back to restart"
-                    run systemlctl --user restart "$name" ;;
+        # Fail loudly on an unknown method. Silently picking restart could
+        # bounce a unit the user explicitly told us to handle differently
+        # (e.g. they typo'd "stop_start"). Better to surface the typo than
+        # restart a database without warning.
+        *)          echo "sd-switch: $name: unknown X-SwitchMethod '$method'" >&2
+                    exit 2 ;;
       esac
     }
 

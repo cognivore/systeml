@@ -38,9 +38,10 @@ use systeml_deps::JobMode;
 use systeml_unit::name::UnitKind;
 use systeml_unit::{UnitName, UnitTypeData};
 use time::OffsetDateTime;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, RwLock};
 use tracing::{debug, info, warn};
 
+use crate::manager::UnitEvent;
 use crate::state::ActiveState;
 use crate::timer::{next_overall, read_last_fire, write_last_fire};
 use crate::Manager;
@@ -66,13 +67,18 @@ pub type TimerControlSender = mpsc::Sender<TimerControl>;
 /// last clone is dropped).
 pub fn spawn(manager: Arc<RwLock<Manager>>) -> TimerControlSender {
     let (tx, rx) = mpsc::channel(64);
-    let scheduler = TimerScheduler {
-        manager,
-        manager_start: OffsetDateTime::now_utc(),
-        rx,
-        last_fires: HashMap::new(),
-    };
-    tokio::spawn(run(scheduler));
+    tokio::spawn(async move {
+        let events = manager.read().await.subscribe();
+        let scheduler = TimerScheduler {
+            manager,
+            manager_start: OffsetDateTime::now_utc(),
+            rx,
+            events,
+            last_fires: HashMap::new(),
+            triggers: HashMap::new(),
+        };
+        run(scheduler).await;
+    });
     tx
 }
 
@@ -80,7 +86,15 @@ struct TimerScheduler {
     manager: Arc<RwLock<Manager>>,
     manager_start: OffsetDateTime,
     rx: mpsc::Receiver<TimerControl>,
+    /// Subscriber to manager state-change events. Used to mirror systemd's
+    /// `timer_trigger_notify`: when a unit we triggered deactivates, flip
+    /// its timer back from "running" to "waiting".
+    events: broadcast::Receiver<UnitEvent>,
     last_fires: HashMap<UnitName, OffsetDateTime>,
+    /// Trigger unit → timer that fired it. Populated when `fire()` queues
+    /// a long-lived target whose substate is still `Active` after dispatch;
+    /// drained when the target deactivates.
+    triggers: HashMap<UnitName, UnitName>,
 }
 
 async fn run(mut sched: TimerScheduler) {
@@ -105,14 +119,24 @@ async fn run(mut sched: TimerScheduler) {
                             Some(TimerControl::Shutdown) | None => break,
                         }
                     }
+                    evt = sched.events.recv() => {
+                        sched.handle_event(evt).await;
+                    }
                 }
             }
             None => {
                 // No active timers. Park until something changes.
                 debug!("no active timers; waiting for refresh");
-                match sched.rx.recv().await {
-                    Some(TimerControl::Refresh) => continue,
-                    Some(TimerControl::Shutdown) | None => break,
+                tokio::select! {
+                    msg = sched.rx.recv() => {
+                        match msg {
+                            Some(TimerControl::Refresh) => continue,
+                            Some(TimerControl::Shutdown) | None => break,
+                        }
+                    }
+                    evt = sched.events.recv() => {
+                        sched.handle_event(evt).await;
+                    }
                 }
             }
         }
@@ -148,15 +172,7 @@ impl TimerScheduler {
                 .get(name)
                 .copied()
                 .or_else(|| read_last_fire(name));
-            let nf = next_overall(
-                now,
-                self.manager_start,
-                None,
-                None,
-                None,
-                t,
-                last_fire,
-            );
+            let nf = next_overall(now, self.manager_start, None, None, None, t, last_fire);
             if let Some(t) = nf {
                 match &best {
                     None => best = Some((t, name.clone())),
@@ -192,7 +208,30 @@ impl TimerScheduler {
 
         info!(timer = %timer_name, target = %target, "timer fires");
         let mut mgr = self.manager.write().await;
-        match mgr.start_unit(target.clone(), JobMode::Replace).await {
+        // Mirror systemd's TIMER_RUNNING transition: while we're triggering
+        // the target, the timer's sub-state is "running".
+        mgr.mark_state(timer_name, ActiveState::Active, "running");
+        let result = mgr.start_unit(target.clone(), JobMode::Replace).await;
+        // Decide whether to flip back to "waiting" now or wait for the
+        // trigger to deactivate. For Type=oneshot services, start_unit
+        // already waited for the process to finish, so by the time we get
+        // here the trigger is no longer Active and we can return to
+        // "waiting" immediately. For long-lived triggers (simple/forking/
+        // notify) the trigger is still Active; record it in `triggers` and
+        // let `handle_event` flip the timer back when it eventually
+        // deactivates — same role systemd's timer_trigger_notify plays.
+        let trigger_still_active = mgr
+            .status
+            .get(&target)
+            .map(|s| s.active == ActiveState::Active)
+            .unwrap_or(false);
+        if trigger_still_active {
+            self.triggers.insert(target.clone(), timer_name.clone());
+        } else {
+            mgr.mark_state(timer_name, ActiveState::Active, "waiting");
+        }
+        drop(mgr);
+        match result {
             Ok(_) => {
                 self.last_fires.insert(timer_name.clone(), fire_time);
                 if let Err(e) = write_last_fire(timer_name, fire_time) {
@@ -202,6 +241,69 @@ impl TimerScheduler {
             }
             Err(e) => warn!(timer = %timer_name, target = %target, error = %e,
                 "linked service failed to start"),
+        }
+    }
+
+    /// Mirror of systemd's `timer_trigger_notify`: when a unit we triggered
+    /// deactivates, flip the timer that fired it back from "running" to
+    /// "waiting". Lagged events fall back to walking every watched trigger.
+    async fn handle_event(&mut self, evt: Result<UnitEvent, broadcast::error::RecvError>) {
+        match evt {
+            Ok(UnitEvent::StateChanged { unit, active, .. }) => {
+                if active == ActiveState::Active {
+                    return;
+                }
+                let Some(timer) = self.triggers.remove(&unit) else {
+                    return;
+                };
+                self.flip_to_waiting(&timer).await;
+            }
+            Ok(UnitEvent::UnitRemoved(unit)) => {
+                // Trigger went away entirely; clear watch and flip timer.
+                if let Some(timer) = self.triggers.remove(&unit) {
+                    self.flip_to_waiting(&timer).await;
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(n)) => {
+                // We dropped n events. Resync by polling current trigger
+                // states; flip timers whose triggers are no longer Active.
+                debug!(dropped = n, "scheduler events lagged; resyncing");
+                let mut to_flip: Vec<UnitName> = Vec::new();
+                {
+                    let mgr = self.manager.read().await;
+                    self.triggers.retain(|trigger, timer| {
+                        let still_active = mgr
+                            .status
+                            .get(trigger)
+                            .map(|s| s.active == ActiveState::Active)
+                            .unwrap_or(false);
+                        if !still_active {
+                            to_flip.push(timer.clone());
+                            return false;
+                        }
+                        true
+                    });
+                }
+                for timer in to_flip {
+                    self.flip_to_waiting(&timer).await;
+                }
+            }
+            // Other event variants are not relevant to the trigger watch.
+            Ok(_) | Err(broadcast::error::RecvError::Closed) => {}
+        }
+    }
+
+    async fn flip_to_waiting(&self, timer: &UnitName) {
+        let mut mgr = self.manager.write().await;
+        // Only flip if the timer is still Active — a concurrent stop_unit
+        // may have moved it to Inactive/dead, and we mustn't override that.
+        let still_active = mgr
+            .status
+            .get(timer)
+            .map(|s| s.active == ActiveState::Active)
+            .unwrap_or(false);
+        if still_active {
+            mgr.mark_state(timer, ActiveState::Active, "waiting");
         }
     }
 }

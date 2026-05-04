@@ -142,3 +142,80 @@ async fn timer_next_fire_minutely() {
     assert_eq!(n.minute(), 31);
     assert_eq!(n.second(), 0);
 }
+
+/// End-to-end: a `Type=simple` service that exits on its own should be
+/// detected by the supervisor and reported as `Inactive/dead` via
+/// `StateChanged`. Without exit detection, this test would hang forever
+/// (state would stay `Active/running`).
+#[tokio::test]
+async fn supervisor_detects_simple_service_exit() {
+    use std::sync::Arc;
+    use systeml_runtime::manager::{Manager, UnitEvent};
+    use systeml_runtime::state::ActiveState;
+    use systeml_unit::name::UnitKind;
+    use systeml_unit::{LoadedUnit, Unit, UnitTypeData};
+    use tokio::sync::RwLock;
+
+    let Some(true_path) = find_in_path("true") else {
+        return;
+    };
+
+    // Service exits successfully on its own — supervisor must detect.
+    let svc = ServiceUnit {
+        service_type: ServiceType::Simple,
+        exec_start: vec![ExecCommand::parse(&true_path).unwrap()],
+        standard_output: StandardStream::Null,
+        standard_error: StandardStream::Null,
+        ..Default::default()
+    };
+    let name = UnitName::plain("supex", UnitKind::Service);
+
+    let manager = Arc::new(RwLock::new(Manager::new()));
+    {
+        let mut m = manager.write().await;
+        m.attach_self(&manager);
+        let mut unit = Unit::empty(name.clone());
+        unit.kind = UnitTypeData::Service(svc.clone());
+        unit.description = "supex".into();
+        let lu = LoadedUnit {
+            unit,
+            warnings: vec![],
+            from_template: false,
+        };
+        m.insert_loaded(name.clone(), lu);
+    }
+
+    // Subscribe before starting so we don't miss the StateChanged event.
+    let mut events = manager.read().await.subscribe();
+
+    // Start the service.
+    {
+        let mut m = manager.write().await;
+        m.start_unit(name.clone(), systeml_deps::JobMode::Replace)
+            .await
+            .unwrap();
+    }
+
+    // Wait up to 5s for an Inactive transition. Without supervisor wiring
+    // this loop would time out — the runner would stay `Active/running`.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let mut saw_inactive = false;
+    while tokio::time::Instant::now() < deadline {
+        let recv = tokio::time::timeout(Duration::from_secs(1), events.recv()).await;
+        match recv {
+            Ok(Ok(UnitEvent::StateChanged { unit, active, sub }))
+                if unit == name && active == ActiveState::Inactive && sub == "dead" =>
+            {
+                saw_inactive = true;
+                break;
+            }
+            Ok(Ok(_)) => continue,
+            Ok(Err(_)) | Err(_) => continue,
+        }
+    }
+    assert!(
+        saw_inactive,
+        "supervisor never reported the service exit (state: {:?})",
+        manager.read().await.unit_status(&name).active
+    );
+}

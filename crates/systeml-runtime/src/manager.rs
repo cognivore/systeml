@@ -12,12 +12,13 @@ use anyhow::{anyhow, Result};
 use indexmap::IndexMap;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use systeml_deps::{JobId, JobMode, JobOutcome, JobType};
 use systeml_unit::name::UnitKind;
 use systeml_unit::{
     is_activatable, load_unit_in, search::user_search_paths, LoadedUnit, UnitName, UnitTypeData,
 };
+use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 /// Why an enable/disable operation made a change. Mirrors systemd's
@@ -92,6 +93,12 @@ pub struct Manager {
     /// Control sender for the timer firing engine. `None` if no
     /// scheduler is attached (tests, headless usage).
     pub timer_control: Option<TimerControlSender>,
+    /// Weak handle to the `Arc<RwLock<Manager>>` that owns us. Set by
+    /// `attach_self` after the daemon wraps the manager. Used by spawned
+    /// supervisor tasks (see `supervise_service`) so they can broadcast
+    /// state changes when a child process exits without holding a strong
+    /// reference cycle. `None` until attached or in headless tests.
+    pub self_weak: Option<Weak<RwLock<Manager>>>,
 }
 
 impl Default for Manager {
@@ -112,7 +119,16 @@ impl Manager {
             events: tx,
             next_job_id: 1,
             timer_control: None,
+            self_weak: None,
         }
+    }
+
+    /// Record a weak handle to the `Arc<RwLock<Manager>>` that owns us. The
+    /// daemon calls this immediately after wrapping `Manager::new()` so the
+    /// service supervisor (spawned per started unit) can take the lock to
+    /// broadcast `StateChanged` when a child exits.
+    pub fn attach_self(&mut self, arc: &Arc<RwLock<Manager>>) {
+        self.self_weak = Some(Arc::downgrade(arc));
     }
 
     /// Attach a timer-firing scheduler's control sender. The daemon
@@ -131,6 +147,20 @@ impl Manager {
             // suffice) or closed (scheduler shut down — fine).
             let _ = tx.try_send(TimerControl::Refresh);
         }
+    }
+
+    /// Update a unit's active/sub state and broadcast `StateChanged`. No-op
+    /// if the unit has no status entry.
+    pub(crate) fn mark_state(&mut self, name: &UnitName, active: ActiveState, sub: &str) {
+        if let Some(st) = self.status.get_mut(name) {
+            st.active = active;
+            st.sub = sub.into();
+        }
+        let _ = self.events.send(UnitEvent::StateChanged {
+            unit: name.clone(),
+            active,
+            sub: sub.into(),
+        });
     }
 
     /// Insert a freshly loaded unit. Sub-state remains "dead" until activated.
@@ -154,11 +184,14 @@ impl Manager {
 
     /// Look up the live status of a unit.
     pub fn unit_status(&self, name: &UnitName) -> UnitStatus {
-        self.status.get(name).cloned().unwrap_or_else(|| UnitStatus {
-            unit: Some(name.clone()),
-            load: LoadState::NotFound,
-            ..UnitStatus::default()
-        })
+        self.status
+            .get(name)
+            .cloned()
+            .unwrap_or_else(|| UnitStatus {
+                unit: Some(name.clone()),
+                load: LoadState::NotFound,
+                ..UnitStatus::default()
+            })
     }
 
     /// `daemon-reload` — rescan search paths, parse, and refresh `units`.
@@ -344,19 +377,19 @@ impl Manager {
             "RefuseManualStart".into(),
             yesno(lu.unit.refuse_manual_start),
         );
-        out.insert(
-            "RefuseManualStop".into(),
-            yesno(lu.unit.refuse_manual_stop),
-        );
-        out.insert(
-            "Documentation".into(),
-            lu.unit.documentation.join(" "),
-        );
+        out.insert("RefuseManualStop".into(), yesno(lu.unit.refuse_manual_stop));
+        out.insert("Documentation".into(), lu.unit.documentation.join(" "));
         // Per-type properties.
         match &lu.unit.kind {
             UnitTypeData::Service(svc) => {
-                out.insert("Type".into(), format!("{:?}", svc.service_type).to_ascii_lowercase());
-                out.insert("Restart".into(), format!("{:?}", svc.restart).to_ascii_lowercase());
+                out.insert(
+                    "Type".into(),
+                    format!("{:?}", svc.service_type).to_ascii_lowercase(),
+                );
+                out.insert(
+                    "Restart".into(),
+                    format!("{:?}", svc.restart).to_ascii_lowercase(),
+                );
                 out.insert("RemainAfterExit".into(), yesno(svc.remain_after_exit));
                 if let Some(p) = &svc.pid_file {
                     out.insert("PIDFile".into(), p.display().to_string());
@@ -386,10 +419,16 @@ impl Manager {
                     );
                 }
                 if let Some(d) = svc.timeout_start_sec {
-                    out.insert("TimeoutStartUSec".into(), format!("{}us", d.as_std().as_micros()));
+                    out.insert(
+                        "TimeoutStartUSec".into(),
+                        format!("{}us", d.as_std().as_micros()),
+                    );
                 }
                 if let Some(d) = svc.timeout_stop_sec {
-                    out.insert("TimeoutStopUSec".into(), format!("{}us", d.as_std().as_micros()));
+                    out.insert(
+                        "TimeoutStopUSec".into(),
+                        format!("{}us", d.as_std().as_micros()),
+                    );
                 }
             }
             UnitTypeData::Timer(t) => {
@@ -421,10 +460,7 @@ impl Manager {
             UnitTypeData::Target(_) | UnitTypeData::Scope(_) | UnitTypeData::Other => {}
         }
         // Install info.
-        out.insert(
-            "WantedBy".into(),
-            install_join(&lu.unit.install.wanted_by),
-        );
+        out.insert("WantedBy".into(), install_join(&lu.unit.install.wanted_by));
         out.insert(
             "RequiredBy".into(),
             install_join(&lu.unit.install.required_by),
@@ -539,6 +575,25 @@ impl Manager {
                 active,
                 sub,
             });
+            // If the service is now Active and its lifecycle isn't already
+            // resolved by start() (i.e. anything except Type=oneshot, which
+            // returns synchronously, and Type=dbus, which we refuse), spawn
+            // a supervisor task so unexpected child exit lands in the
+            // manager and propagates to subscribers (timers, the bus).
+            if active == ActiveState::Active
+                && !matches!(
+                    runner.svc.service_type,
+                    systeml_unit::service::ServiceType::Oneshot
+                        | systeml_unit::service::ServiceType::Dbus
+                )
+            {
+                if let Some(weak) = self.self_weak.clone() {
+                    crate::service::supervise::spawn(weak, runner.clone(), name.clone());
+                } else {
+                    warn!(unit = %name,
+                        "manager has no self-weak; service exit will not be detected");
+                }
+            }
             return Ok(if out.error.is_some() {
                 JobOutcome::Failed
             } else {
@@ -547,23 +602,20 @@ impl Manager {
         }
         // Targets: simply mark active.
         if name.kind == UnitKind::Target {
-            if let Some(st) = self.status.get_mut(name) {
-                st.active = ActiveState::Active;
-                st.sub = "active".into();
-            }
-            let _ = self.events.send(UnitEvent::StateChanged {
-                unit: name.clone(),
-                active: ActiveState::Active,
-                sub: "active".into(),
-            });
+            self.mark_state(name, ActiveState::Active, "active");
             return Ok(JobOutcome::Done);
         }
         // Timers/paths/sockets: load-time activation handled by per-type
-        // engines; here we just mark active.
-        if let Some(st) = self.status.get_mut(name) {
-            st.active = ActiveState::Active;
-            st.sub = "running".into();
-        }
+        // engines; here we just mark active. The sub-state mirrors systemd:
+        // a started-but-idle timer/path is "waiting" (it transitions to
+        // "running" only while triggering its target); a started socket is
+        // "listening".
+        let sub = match name.kind {
+            UnitKind::Timer | UnitKind::Path => "waiting",
+            UnitKind::Socket => "listening",
+            _ => "running",
+        };
+        self.mark_state(name, ActiveState::Active, sub);
         // A newly-active timer needs the scheduler to recompute.
         if name.kind == UnitKind::Timer {
             self.poke_timer_scheduler();
@@ -575,22 +627,11 @@ impl Manager {
         if name.kind == UnitKind::Service {
             if let Some(r) = self.services.get(name).cloned() {
                 let _ = r.stop().await;
-                if let Some(st) = self.status.get_mut(name) {
-                    st.active = ActiveState::Inactive;
-                    st.sub = "dead".into();
-                }
-                let _ = self.events.send(UnitEvent::StateChanged {
-                    unit: name.clone(),
-                    active: ActiveState::Inactive,
-                    sub: "dead".into(),
-                });
+                self.mark_state(name, ActiveState::Inactive, "dead");
                 return Ok(JobOutcome::Done);
             }
         }
-        if let Some(st) = self.status.get_mut(name) {
-            st.active = ActiveState::Inactive;
-            st.sub = "dead".into();
-        }
+        self.mark_state(name, ActiveState::Inactive, "dead");
         // A newly-inactive timer should drop out of the scheduler's view.
         if name.kind == UnitKind::Timer {
             self.poke_timer_scheduler();
@@ -685,7 +726,11 @@ impl Manager {
 }
 
 fn yesno(b: bool) -> String {
-    if b { "yes".into() } else { "no".into() }
+    if b {
+        "yes".into()
+    } else {
+        "no".into()
+    }
 }
 
 fn install_join(set: &std::collections::BTreeSet<UnitName>) -> String {
@@ -694,4 +739,3 @@ fn install_join(set: &std::collections::BTreeSet<UnitName>) -> String {
         .collect::<Vec<_>>()
         .join(" ")
 }
-

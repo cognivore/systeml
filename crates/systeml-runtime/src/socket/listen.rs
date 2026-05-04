@@ -15,7 +15,6 @@ use std::net::{SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use systeml_unit::socket::{ListenSpec, SocketAddrSpec, SocketUnit};
-use tracing::warn;
 
 /// Set FD_CLOEXEC on a freshly-created socket. macOS lacks `SOCK_CLOEXEC`,
 /// so we emulate it post-creation. Errors propagate (cloexec is a correctness
@@ -95,14 +94,12 @@ fn bind_stream(spec: &SocketAddrSpec, backlog: usize, unit: &SocketUnit) -> Resu
             unit,
         ),
         SocketAddrSpec::UnixPath(p) => bind_unix(p, SockType::Stream, Some(backlog), unit),
-        SocketAddrSpec::UnixAbstract(name) => {
-            warn!(
-                name = %name,
-                "Linux abstract namespace not supported on macOS; falling back to /tmp/{name}"
-            );
-            let fallback = PathBuf::from(format!("/tmp/{name}"));
-            bind_unix(&fallback, SockType::Stream, Some(backlog), unit)
-        }
+        SocketAddrSpec::UnixAbstract(name) => Err(anyhow!(
+            "ListenStream=@{name}: Linux abstract namespace sockets are unsupported on macOS. \
+             Use a filesystem path (e.g. ListenStream=/tmp/{name}.sock) explicitly — silently \
+             rewriting your listen path would change the socket's security and namespacing \
+             semantics."
+        )),
         SocketAddrSpec::Vsock(_) | SocketAddrSpec::Netlink(_) => {
             Err(anyhow!("address family not supported on macOS"))
         }
