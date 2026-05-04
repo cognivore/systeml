@@ -211,6 +211,38 @@ pub fn next_fire(
     None
 }
 
+/// Compute the most recent past instant ≤ `before` at which `spec` fires,
+/// or `None` if no instant matches within the lookback window.
+///
+/// Used by the timer scheduler to implement `Persistent=yes` catch-up:
+/// if `last_fire < prev_fire(now)`, the timer should fire immediately to
+/// cover the missed instant — same behavior systemd documents in
+/// `systemd.timer(5)`.
+///
+/// Implemented by stepping `next_fire` forward from one year before
+/// `before` and remembering the latest match. O(n) in the number of
+/// matching instants per year — fine for typical Persistent schedules
+/// (daily, hourly, weekly), bounded by an explicit safety cap for
+/// pathological per-second specs.
+pub fn prev_fire(before: OffsetDateTime, spec: &CalendarSpec) -> Option<OffsetDateTime> {
+    let lookback_start = before - time::Duration::days(366);
+    let mut cursor = lookback_start;
+    let mut last: Option<OffsetDateTime> = None;
+    // Cap iterations defensively. A `*-*-* *:*:*` spec produces ~31M
+    // candidates/year; we don't want to walk all of them. For sane
+    // Persistent timers the cap is never reached.
+    for _ in 0..200_000 {
+        match next_fire(cursor, spec, None) {
+            Some(t) if t <= before => {
+                last = Some(t);
+                cursor = t;
+            }
+            _ => break,
+        }
+    }
+    last
+}
+
 fn next_in_set(fs: &FieldSet, after: u32, lo: u32, hi: u32) -> Option<u32> {
     match &fs.values {
         None => Some(after.max(lo)),
@@ -320,5 +352,30 @@ mod tests {
         // Tomorrow 00:00:00.
         assert_eq!(next.hour(), 0);
         assert_eq!(next.day(), 28);
+    }
+
+    #[test]
+    fn prev_fire_finds_today_before_now() {
+        // *-*-* 14:00:00 — daily backup. Now is 16:39 today.
+        // The most recent past instant is today 14:00.
+        let spec = CalendarSpec::parse("*-*-* 14:00:00").unwrap();
+        let now = datetime!(2026-05-04 16:39:00 UTC);
+        let prev = prev_fire(now, &spec).unwrap();
+        assert_eq!(prev.year(), 2026);
+        assert_eq!(prev.month() as u8, 5);
+        assert_eq!(prev.day(), 4);
+        assert_eq!(prev.hour(), 14);
+        assert_eq!(prev.minute(), 0);
+    }
+
+    #[test]
+    fn prev_fire_skips_to_yesterday_when_before_today_instant() {
+        // Now is 13:00 today, before today's 14:00 instant.
+        // Most recent past instant should be yesterday 14:00.
+        let spec = CalendarSpec::parse("*-*-* 14:00:00").unwrap();
+        let now = datetime!(2026-05-04 13:00:00 UTC);
+        let prev = prev_fire(now, &spec).unwrap();
+        assert_eq!(prev.day(), 3);
+        assert_eq!(prev.hour(), 14);
     }
 }

@@ -163,6 +163,59 @@ impl Manager {
         });
     }
 
+    /// Auto-activate every loaded unit that has an enable-link
+    /// (`<target>.wants/<unit>`, `.requires/`, or `.upholds/`) in any
+    /// search path. Mirrors what systemd PID 1 does at boot when it
+    /// starts `default.target` and the transitive `wants/` closure
+    /// pulls in everything enabled.
+    ///
+    /// Without this, every daemon restart leaves enabled timers stuck
+    /// at `Inactive` until something starts them — `systemctl start`,
+    /// or the next `home-manager switch` invoking the sd-switch shim
+    /// against a *changed* unit. Untouched-but-enabled timers (the
+    /// common case for stable schedules like a daily backup) just
+    /// silently never fire.
+    ///
+    /// Skips already-Active units so a SIGHUP `daemon-reload` is a no-op
+    /// on the activation front (matching systemd's reload semantics).
+    pub async fn activate_enabled_units(&mut self) -> Result<()> {
+        let mut started = 0usize;
+        let mut skipped = 0usize;
+        let names: Vec<UnitName> = self.units.keys().cloned().collect();
+        for name in names {
+            // Only timer/service/path/socket units are activatable in this
+            // sense; targets are pulled in implicitly when needed.
+            match name.kind {
+                UnitKind::Timer
+                | UnitKind::Service
+                | UnitKind::Path
+                | UnitKind::Socket => {}
+                _ => continue,
+            }
+            if self
+                .status
+                .get(&name)
+                .map(|s| s.active == ActiveState::Active)
+                .unwrap_or(false)
+            {
+                skipped += 1;
+                continue;
+            }
+            if !install::has_install_link(&name) {
+                continue;
+            }
+            match self.start_unit(name.clone(), JobMode::Replace).await {
+                Ok(_) => {
+                    started += 1;
+                    info!(unit = %name, "auto-started enabled unit");
+                }
+                Err(e) => warn!(unit = %name, error = %e, "auto-start failed"),
+            }
+        }
+        info!(started, already_active = skipped, "activate_enabled_units complete");
+        Ok(())
+    }
+
     /// Insert a freshly loaded unit. Sub-state remains "dead" until activated.
     pub fn insert_loaded(&mut self, name: UnitName, lu: LoadedUnit) {
         let st = UnitStatus {
@@ -616,11 +669,35 @@ impl Manager {
             _ => "running",
         };
         self.mark_state(name, ActiveState::Active, sub);
-        // A newly-active timer needs the scheduler to recompute.
+        // A newly-active timer needs the scheduler to recompute. We also
+        // touch the persistent stamp on first activation, matching
+        // systemd's `timer_start` → `touch_file` behavior. Without this,
+        // a `Persistent=yes` timer that's never fired has no anchor for
+        // catch-up to compare against on subsequent restarts.
         if name.kind == UnitKind::Timer {
+            self.stamp_persistent_timer_if_needed(name);
             self.poke_timer_scheduler();
         }
         Ok(JobOutcome::Done)
+    }
+
+    fn stamp_persistent_timer_if_needed(&self, name: &UnitName) {
+        let Some(lu) = self.units.get(name) else {
+            return;
+        };
+        let UnitTypeData::Timer(t) = &lu.unit.kind else {
+            return;
+        };
+        if !t.persistent {
+            return;
+        }
+        if crate::timer::read_last_fire(name).is_some() {
+            return;
+        }
+        let now = time::OffsetDateTime::now_utc();
+        if let Err(e) = crate::timer::write_last_fire(name, now) {
+            warn!(unit = %name, error = %e, "failed to stamp persistent timer");
+        }
     }
 
     async fn run_stop(&mut self, name: &UnitName) -> Result<JobOutcome> {

@@ -308,6 +308,38 @@ pub fn unit_file_state(name: &UnitName, install: Option<&Install>) -> String {
     }
 }
 
+/// Whether this unit has a `<target>.wants/`, `<target>.requires/`, or
+/// `<target>.upholds/` symlink in any search path. Independent of whether
+/// the unit file itself is a symlink (which `unit_file_state` confounds
+/// with `linked`). Used at daemon startup to decide which units to
+/// auto-activate — the moral equivalent of systemd PID 1 starting
+/// `default.target` and letting the transitive `wants/` closure pull
+/// units in.
+pub fn has_install_link(name: &UnitName) -> bool {
+    let want = name.filename();
+    for base in user_search_paths() {
+        let entries = match std::fs::read_dir(&base) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let dn = match path.file_name().and_then(|s| s.to_str()) {
+                Some(s) => s,
+                None => continue,
+            };
+            if !(dn.ends_with(".wants") || dn.ends_with(".requires") || dn.ends_with(".upholds")) {
+                continue;
+            }
+            let candidate = path.join(&want);
+            if candidate.is_symlink() || candidate.exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

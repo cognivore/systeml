@@ -58,6 +58,32 @@ pub fn next_overall(
 ) -> Option<OffsetDateTime> {
     let mut best: Option<OffsetDateTime> = None;
 
+    // Persistent=yes catch-up. systemd.timer(5):
+    //
+    //   the service unit is triggered immediately if it would have been
+    //   triggered at least once during the time when the timer was inactive.
+    //
+    // Implementation: if a calendar instant happened in the past *after*
+    // our last_fire stamp, fire ASAP. We surface it as `now` rather than
+    // the past instant itself so the scheduler's `deadline_to_sleep` floor
+    // doesn't have to (and the next-fire becomes "0 seconds from now").
+    //
+    // First-ever activation has `last_fire = None`; in that case we use
+    // the manager start time as the anchor. That mirrors systemd's
+    // touch-stamp-at-activation behavior with the manager start serving
+    // as the implicit "the timer just became active" mtime.
+    if timer.persistent {
+        let anchor = last_fire.unwrap_or(manager_start);
+        for spec in &timer.on_calendar {
+            if let Some(prev) = schedule::prev_fire(now, spec) {
+                if prev > anchor {
+                    best = Some(min_t(best, now));
+                    break;
+                }
+            }
+        }
+    }
+
     for spec in &timer.on_calendar {
         if let Some(t) = schedule::next_fire(now, spec, last_fire) {
             best = Some(min_t(best, t));

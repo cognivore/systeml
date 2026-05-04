@@ -77,6 +77,17 @@ async fn main() -> Result<()> {
             warn!(error = %e, "initial daemon-reload failed");
         }
         info!(units = m.units.len(), "units loaded");
+        // Boot-time activation: start every unit with a `<target>.wants/`
+        // (or .requires/.upholds) symlink. Without this, daemon restarts
+        // (e.g. via `launchctl kickstart -k` after a binary refresh) leave
+        // enabled timers stuck at Inactive and they silently miss their
+        // schedules until something else starts them. Real systemd handles
+        // this implicitly via `default.target` activation at PID-1 boot;
+        // SIGHUP daemon-reload below intentionally does *not* re-activate
+        // (matching systemd's reload semantics).
+        if let Err(e) = m.activate_enabled_units().await {
+            warn!(error = %e, "boot-time activation failed");
+        }
     }
 
     // Bind the bus.
